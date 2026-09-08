@@ -151,14 +151,16 @@ class SecurityChecker:
 
         # Check against server's own files
         for server_path in self.policy.server_executable_paths:
-            if canonical_path.startswith(server_path):
+            server_root = Path(server_path).resolve(strict=False)
+            if Path(canonical_path) == server_root or server_root in Path(canonical_path).parents:
                 raise SecurityViolation(
                     f"Access denied to server files: {canonical_path}"
                 )
 
         # Check against system critical paths
         for critical_path in self.policy.system_critical_paths:
-            if canonical_path.startswith(critical_path):
+            critical_root = Path(critical_path).resolve(strict=False)
+            if Path(canonical_path) == critical_root or critical_root in Path(canonical_path).parents:
                 raise SecurityViolation(
                     f"Access denied to critical system path: {canonical_path}"
                 )
@@ -167,7 +169,8 @@ class SecurityChecker:
         for forbidden in self.policy.forbidden_paths:
             # Resolve forbidden paths too for a correct comparison
             forbidden_canonical = self.resolve_path_safely(forbidden)
-            if canonical_path.startswith(forbidden_canonical):
+            forbidden_root = Path(forbidden_canonical)
+            if Path(canonical_path) == forbidden_root or forbidden_root in Path(canonical_path).parents:
                 raise SecurityViolation(
                     f"Path explicitly forbidden: {canonical_path}"
                 )
@@ -180,7 +183,8 @@ class SecurityChecker:
         else:
             for allowed in self.policy.allowed_paths:
                 allowed_canonical = self.resolve_path_safely(allowed)
-                if canonical_path.startswith(allowed_canonical):
+                allowed_root = Path(allowed_canonical)
+                if Path(canonical_path) == allowed_root or allowed_root in Path(canonical_path).parents:
                     path_allowed = True
                     break
 
@@ -204,6 +208,11 @@ class SecurityChecker:
             # Get current user info
             current_uid = os.getuid()
             current_gids = [os.getgid()] + os.getgroups()
+
+            # UID 0 bypasses discretionary read/write mode checks on Linux.
+            # Path allow/deny policy is enforced before this permission check.
+            if current_uid == 0:
+                return
 
             # Check ownership and permissions
             file_mode = stat_info.st_mode
@@ -613,6 +622,121 @@ class SecureUbuntuController:
             self.logger.error(f"File write failed for '{file_path}': {e}")
             raise
 
+    def update_file(self, file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> Dict[str, Any]:
+        """Replace exact text in an existing file using the atomic write path."""
+        if not old_string:
+            raise ValueError("old_string must not be empty")
+
+        content = self.read_file(file_path)
+        occurrences = content.count(old_string)
+        if occurrences == 0:
+            raise ValueError("old_string was not found in the file")
+        if occurrences > 1 and not replace_all:
+            raise ValueError(
+                f"old_string occurs {occurrences} times; set replace_all=true or provide more context"
+            )
+
+        updated = content.replace(old_string, new_string, -1 if replace_all else 1)
+        self.write_file(file_path, updated)
+        return {"success": True, "path": file_path, "replacements": occurrences if replace_all else 1}
+
+    def create_directory(self, path: str, parents: bool = True) -> Dict[str, Any]:
+        """Create a directory after validating its destination and parent."""
+        canonical_path = self.security_checker.validate_path_access(path, "write")
+        path_obj = Path(canonical_path)
+        parent = path_obj.parent
+        self.security_checker.validate_path_access(str(parent), "write")
+        path_obj.mkdir(parents=parents, exist_ok=True)
+        self.audit_logger.log_file_access("CREATE_DIRECTORY", canonical_path, self.current_user, True)
+        return {"success": True, "path": canonical_path, "created": True}
+
+    def move_path(self, source: str, destination: str, overwrite: bool = False) -> Dict[str, Any]:
+        """Move or rename one file or directory within allowed paths."""
+        canonical_source = self.security_checker.validate_path_access(source, "write")
+        canonical_destination = self.security_checker.validate_path_access(destination, "write")
+        source_path = Path(canonical_source)
+        destination_path = Path(canonical_destination)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source does not exist: {canonical_source}")
+        self.security_checker.validate_path_access(str(source_path.parent), "write")
+        self.security_checker.validate_path_access(str(destination_path.parent), "write")
+        if destination_path.exists() and not overwrite:
+            raise FileExistsError(f"Destination already exists: {canonical_destination}")
+        if destination_path.exists() and overwrite:
+            if destination_path.is_dir():
+                shutil.rmtree(destination_path)
+            else:
+                destination_path.unlink()
+        shutil.move(str(source_path), str(destination_path))
+        self.audit_logger.log_file_access("MOVE", canonical_source, self.current_user, True)
+        return {"success": True, "source": canonical_source, "destination": canonical_destination}
+
+    def delete_path(self, path: str, recursive: bool = False) -> Dict[str, Any]:
+        """Delete a file, symlink, or optionally an empty/non-empty directory."""
+        canonical_path = self.security_checker.validate_path_access(path, "write")
+        path_obj = Path(canonical_path)
+        allowed_roots = {
+            Path(self.security_checker.resolve_path_safely(allowed_path))
+            for allowed_path in self.security_policy.allowed_paths
+        }
+        if path_obj in allowed_roots:
+            raise SecurityViolation(f"Refusing to delete an allowed path root: {canonical_path}")
+        if not path_obj.exists() and not path_obj.is_symlink():
+            raise FileNotFoundError(f"Path does not exist: {canonical_path}")
+        self.security_checker.validate_path_access(str(path_obj.parent), "write")
+        if path_obj.is_dir() and not path_obj.is_symlink():
+            if recursive:
+                shutil.rmtree(path_obj)
+            else:
+                path_obj.rmdir()
+        else:
+            path_obj.unlink()
+        self.audit_logger.log_file_access("DELETE", canonical_path, self.current_user, True)
+        return {"success": True, "path": canonical_path, "recursive": recursive}
+
+    def filesystem_diagnostics(self, path: str = "/opt", probe_write: bool = False) -> Dict[str, Any]:
+        """Report effective filesystem access and optionally verify a temporary write cycle."""
+        canonical_path = self.security_checker.validate_path_access(path, "access")
+        path_obj = Path(canonical_path)
+        result: Dict[str, Any] = {
+            "path": canonical_path,
+            "exists": path_obj.exists(),
+            "is_directory": path_obj.is_dir(),
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+            "groups": os.getgroups(),
+            "readable": os.access(canonical_path, os.R_OK),
+            "writable": os.access(canonical_path, os.W_OK),
+            "executable": os.access(canonical_path, os.X_OK),
+            "policy": {
+                "allowed_paths": self.security_policy.allowed_paths,
+                "forbidden_paths": self.security_policy.forbidden_paths,
+                "allow_sudo": self.security_policy.allow_sudo,
+                "max_file_size": self.security_policy.max_file_size,
+            },
+            "probe": {"requested": probe_write, "success": None},
+        }
+        if probe_write:
+            if not path_obj.is_dir():
+                raise ValueError(f"Write probe requires a directory: {canonical_path}")
+            self.security_checker.validate_path_access(canonical_path, "write")
+            probe_path: Optional[Path] = None
+            try:
+                probe_fd, probe_name = tempfile.mkstemp(prefix=".ubuntu-mcp-probe-", dir=canonical_path)
+                probe_path = Path(probe_name)
+                with os.fdopen(probe_fd, "w", encoding="utf-8") as probe_file:
+                    probe_file.write("create")
+                probe_path.write_text("update", encoding="utf-8")
+                if probe_path.read_text(encoding="utf-8") != "update":
+                    raise OSError("Write probe content verification failed")
+                probe_path.unlink()
+                result["probe"] = {"requested": True, "success": True}
+            except Exception as error:
+                if probe_path is not None:
+                    probe_path.unlink(missing_ok=True)
+                result["probe"] = {"requested": True, "success": False, "error": str(error)}
+        return result
+
     def get_system_info(self) -> Dict[str, Any]:
         """Get basic system information using safe methods"""
         try:
@@ -901,6 +1025,53 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         try:
             success = controller.write_file(file_path, content, create_dirs)
             return json.dumps({"success": success, "path": file_path})
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("update_file")
+    async def update_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+        """Replaces exact text in an existing file using an atomic write.
+
+        Args:
+            file_path: Existing file to update.
+            old_string: Exact text to replace.
+            new_string: Replacement text.
+            replace_all: Replace every occurrence; otherwise exactly one match is required.
+        """
+        try:
+            return json.dumps(controller.update_file(file_path, old_string, new_string, replace_all), indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("create_directory")
+    async def create_directory(path: str, parents: bool = True) -> str:
+        """Creates an allowed directory, optionally including missing parents."""
+        try:
+            return json.dumps(controller.create_directory(path, parents), indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("move_path")
+    async def move_path(source: str, destination: str, overwrite: bool = False) -> str:
+        """Moves or renames a file or directory within allowed paths."""
+        try:
+            return json.dumps(controller.move_path(source, destination, overwrite), indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("delete_path")
+    async def delete_path(path: str, recursive: bool = False) -> str:
+        """Deletes a file or directory after policy and permission validation."""
+        try:
+            return json.dumps(controller.delete_path(path, recursive), indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("filesystem_diagnostics")
+    async def filesystem_diagnostics(path: str = "/opt", probe_write: bool = False) -> str:
+        """Reports effective access for a path and optionally runs a temporary CRUD probe."""
+        try:
+            return json.dumps(controller.filesystem_diagnostics(path, probe_write), indent=2)
         except Exception as e:
             return format_error(e)
 
