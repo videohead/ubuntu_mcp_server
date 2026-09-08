@@ -18,6 +18,7 @@ import tempfile
 import hashlib
 import time
 import shlex
+import uuid
 from pathlib import Path, PurePath
 from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass, field
@@ -26,11 +27,11 @@ import re
 
 # MCP Protocol implementation - assuming this module exists
 # You can use a mock for local testing if mcp is not installed:
-# class FastMCP:
+# class MCPServer:
 #     def __init__(self, name): self.name = name
 #     def tool(self, name): return lambda f: f
 #     async def run_stdio_async(self): print("MCP server mock running...")
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 
 class SecurityViolation(Exception):
@@ -647,6 +648,126 @@ class SecureUbuntuController:
             self.logger.error(f"System info gathering failed: {e}")
             raise
 
+    def list_agent_skills(self) -> Dict[str, Any]:
+        """List all available domain agent skills and specialized agents."""
+        skills_dir = Path("/opt/.agents/skills")
+        agents_dir = Path("/opt/.github/agents")
+
+        available = {"skills": [], "specialized_agents": []}
+        if skills_dir.exists():
+            for p in skills_dir.iterdir():
+                if p.is_dir() and (p / "SKILL.md").exists():
+                    available["skills"].append({
+                        "name": p.name,
+                        "path": str(p / "SKILL.md")
+                    })
+        if agents_dir.exists():
+            for p in agents_dir.glob("*.agent.md"):
+                available["specialized_agents"].append({
+                    "name": p.stem.replace(".agent", ""),
+                    "path": str(p)
+                })
+        return available
+
+    def load_agent_skill(self, skill_name: str) -> str:
+        """Load instructions for an agent skill or specialized agent."""
+        skill_name = skill_name.strip()
+        skill_file = Path(f"/opt/.agents/skills/{skill_name}/SKILL.md")
+        agent_file = Path(f"/opt/.github/agents/{skill_name}.agent.md")
+        if not agent_file.exists():
+            agent_file = Path(f"/opt/.github/agents/{skill_name}")
+
+        if skill_file.exists():
+            return skill_file.read_text(encoding="utf-8")
+        elif agent_file.exists():
+            return agent_file.read_text(encoding="utf-8")
+        else:
+            raise ValueError(f"Skill or agent '{skill_name}' not found")
+
+    def start_background_job(self, command: str, description: str = "", working_dir: str = "/opt") -> Dict[str, Any]:
+        """Start a long running process in the background with tracking."""
+        jobs_dir = Path("/tmp/metis-jobs")
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(uuid.uuid4())[:8]
+        job_path = jobs_dir / job_id
+        job_path.mkdir(parents=True, exist_ok=True)
+
+        log_file = job_path / "output.log"
+        status_file = job_path / "status.json"
+
+        resolved_working_dir = self.security_checker.validate_path_access(working_dir, "access")
+
+        status_info = {
+            "job_id": job_id,
+            "description": description,
+            "command": command,
+            "working_dir": resolved_working_dir,
+            "status": "running",
+            "start_time": time.time()
+        }
+        status_file.write_text(json.dumps(status_info, indent=2))
+
+        # Launch background process detached
+        wrapped_cmd = f"cd {shlex.quote(resolved_working_dir)} && ({command}) > {shlex.quote(str(log_file))} 2>&1; echo $? > {shlex.quote(str(job_path / 'exit_code'))}"
+        process = subprocess.Popen(["bash", "-c", wrapped_cmd], start_new_session=True)
+
+        self.audit_logger.log_security_violation("BG_JOB_STARTED", self.current_user, f"Started background job {job_id}: {command}")
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "pid": process.pid,
+            "log_file": str(log_file)
+        }
+
+    def get_job_status(self, job_id: str, tail_lines: int = 50) -> Dict[str, Any]:
+        """Get the status and output of a background job."""
+        jobs_dir = Path("/tmp/metis-jobs")
+        job_path = jobs_dir / job_id
+        if not job_path.exists():
+            raise ValueError(f"Job '{job_id}' not found")
+
+        status_file = job_path / "status.json"
+        exit_code_file = job_path / "exit_code"
+        log_file = job_path / "output.log"
+
+        status_info = {}
+        if status_file.exists():
+            status_info = json.loads(status_file.read_text())
+
+        is_done = exit_code_file.exists()
+        exit_code = int(exit_code_file.read_text().strip()) if is_done else None
+
+        logs = ""
+        if log_file.exists():
+            lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            logs = "\n".join(lines[-tail_lines:])
+
+        return {
+            "job_id": job_id,
+            "description": status_info.get("description", ""),
+            "command": status_info.get("command", ""),
+            "status": "completed" if is_done else "running",
+            "exit_code": exit_code,
+            "success": exit_code == 0 if is_done else None,
+            "recent_logs": logs
+        }
+
+    def list_background_jobs(self) -> List[Dict[str, Any]]:
+        """List all background jobs and their statuses."""
+        jobs_dir = Path("/tmp/metis-jobs")
+        if not jobs_dir.exists():
+            return []
+
+        jobs = []
+        for job_folder in jobs_dir.iterdir():
+            if job_folder.is_dir():
+                job_id = job_folder.name
+                try:
+                    jobs.append(self.get_job_status(job_id, tail_lines=5))
+                except Exception:
+                    continue
+        return sorted(jobs, key=lambda x: x.get("job_id", ""), reverse=True)
+
 
 def create_secure_policy() -> SecurityPolicy:
     """Create a highly secure policy for production use"""
@@ -655,7 +776,7 @@ def create_secure_policy() -> SecurityPolicy:
     script_dir = os.path.dirname(current_script)
 
     return SecurityPolicy(
-        allowed_paths=[home_dir, "/tmp", "/var/tmp"],
+        allowed_paths=[home_dir, "/tmp", "/var/tmp", "/opt"],
         forbidden_paths=["/etc", "/root", "/boot", "/sys", "/proc", "/dev", "/var/log", "/var/lib", "/usr", "/sbin",
                          "/bin"],
         max_command_timeout=15,
@@ -716,10 +837,10 @@ def create_development_policy() -> SecurityPolicy:
     )
 
 
-def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> FastMCP:
+def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
     """Create and configure the secure Ubuntu MCP server"""
     controller = SecureUbuntuController(security_policy)
-    mcp = FastMCP("Secure Ubuntu Controller")
+    mcp = MCPServer("Secure Ubuntu Controller")
 
     def format_error(e: Exception) -> str:
         return json.dumps({"error": str(e), "type": type(e).__name__}, indent=2)
@@ -837,6 +958,87 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> FastMCP:
             command = f"apt search {shlex.quote(query)}"
             result = await controller.execute_command(command)
             return json.dumps(result, indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("list_agent_skills")
+    async def list_agent_skills() -> str:
+        """
+        Lists all available domain agent skills and specialized reviewer roles in /opt.
+
+        Returns:
+            JSON string containing lists of available skills and specialized agents.
+        """
+        try:
+            skills = controller.list_agent_skills()
+            return json.dumps(skills, indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("load_agent_skill")
+    async def load_agent_skill(skill_name: str) -> str:
+        """
+        Loads the instructions, guidelines, and rules for a specific domain skill or agent.
+
+        Args:
+            skill_name: The name of the skill (e.g. 'webaudio-dsp', 'comfyui-workflow') or agent.
+
+        Returns:
+            The raw Markdown text containing the skill/agent guidelines.
+        """
+        try:
+            return controller.load_agent_skill(skill_name)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("start_background_job")
+    async def start_background_job(command: str, description: str = "", working_dir: str = "/opt") -> str:
+        """
+        Starts a long-running command in the background (decoupled from chat request timeout).
+
+        Args:
+            command: The shell command to execute in background.
+            description: Short summary of what this job does.
+            working_dir: The directory to run the command in (default: /opt).
+
+        Returns:
+            JSON string with job_id, status, and log_file path.
+        """
+        try:
+            res = controller.start_background_job(command, description, working_dir)
+            return json.dumps(res, indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("get_job_status")
+    async def get_job_status(job_id: str, tail_lines: int = 50) -> str:
+        """
+        Checks the status, exit code, and recent logs of a background job.
+
+        Args:
+            job_id: The job identifier returned by start_background_job.
+            tail_lines: Number of recent log lines to return (default: 50).
+
+        Returns:
+            JSON string with job status, return code, and recent output logs.
+        """
+        try:
+            res = controller.get_job_status(job_id, tail_lines)
+            return json.dumps(res, indent=2)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool("list_background_jobs")
+    async def list_background_jobs() -> str:
+        """
+        Lists all background jobs tracked on the system.
+
+        Returns:
+            JSON list of all background jobs and their execution states.
+        """
+        try:
+            jobs = controller.list_background_jobs()
+            return json.dumps(jobs, indent=2)
         except Exception as e:
             return format_error(e)
 
@@ -962,8 +1164,18 @@ async def main():
     parser.add_argument("--test", action="store_true", help="Run functionality tests")
     parser.add_argument("--security-test", action="store_true", help="Run security validation tests")
     parser.add_argument("--log-level", default="INFO", help="Logging level (e.g., DEBUG, INFO, WARNING)")
+    parser.add_argument("--transport", choices=["stdio", "streamable-http"],
+                         default=os.environ.get("MCP_TRANSPORT", "stdio"),
+                         help="Transport to serve the MCP protocol over")
+    parser.add_argument("--host", default=os.environ.get("MCP_HOST", "127.0.0.1"),
+                         help="Host to bind when using --transport streamable-http")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_PORT", "8000")),
+                         help="Port to bind when using --transport streamable-http")
 
     args = parser.parse_args()
+
+    if args.transport == "streamable-http" and not (1 <= args.port <= 65535):
+        parser.error(f"--port must be between 1 and 65535, got {args.port}")
 
     logging.basicConfig(level=args.log_level.upper(), format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -980,9 +1192,15 @@ async def main():
     else:
         policy = create_secure_policy()
 
-    print(f"Starting Secure Ubuntu MCP Server with '{args.policy}' policy...", file=sys.stderr)
     mcp_server = create_ubuntu_mcp_server(policy)
-    await mcp_server.run_stdio_async()
+
+    if args.transport == "streamable-http":
+        print(f"Starting Secure Ubuntu MCP Server with '{args.policy}' policy on "
+              f"http://{args.host}:{args.port}/mcp ...", file=sys.stderr)
+        await mcp_server.run_streamable_http_async(host=args.host, port=args.port)
+    else:
+        print(f"Starting Secure Ubuntu MCP Server with '{args.policy}' policy...", file=sys.stderr)
+        await mcp_server.run_stdio_async()
 
 
 if __name__ == "__main__":
