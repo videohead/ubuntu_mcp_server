@@ -605,6 +605,18 @@ class SecureUbuntuController:
             try:
                 with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
                     f.write(content)
+                # mkstemp creates the file 0600 and shutil.move preserves that
+                # mode, which on a root-run service produced root-only (700/600)
+                # host files the owner could not read. Re-apply the existing
+                # file's mode when present, else a group-writable default that
+                # respects the process umask.
+                try:
+                    if path_obj.exists():
+                        os.chmod(temp_path_str, stat.S_IMODE(path_obj.stat().st_mode))
+                    else:
+                        os.chmod(temp_path_str, 0o664 & ~int(os.environ.get("MCP_FILE_UMASK", "0002"), 8))
+                except OSError as chmod_err:
+                    self.logger.warning(f"Could not set mode on {temp_path_str}: {chmod_err}")
                 # Atomic move
                 shutil.move(str(temp_path), canonical_path)
                 self.audit_logger.log_file_access("WRITE", canonical_path, self.current_user, True)
@@ -1344,6 +1356,16 @@ async def main():
                          help="Port to bind when using --transport streamable-http")
 
     args = parser.parse_args()
+
+    # Honor MCP_FILE_UMASK so files written to host-mounted volumes are not
+    # root-only. The controller writes via tempfile + atomic move; tempfile
+    # uses mode 0600 by default, so apply an explicit permissive umask early
+    # and chmod the temp file before the move in write_file().
+    file_umask = os.environ.get("MCP_FILE_UMASK", "0002").strip()
+    try:
+        os.umask(int(file_umask, 8))
+    except (ValueError, OSError) as e:
+        logging.getLogger(__name__).warning(f"Ignoring invalid MCP_FILE_UMASK={file_umask!r}: {e}")
 
     if args.transport == "streamable-http" and not (1 <= args.port <= 65535):
         parser.error(f"--port must be between 1 and 65535, got {args.port}")
