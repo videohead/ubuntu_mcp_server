@@ -34,6 +34,10 @@ import re
 from mcp.server.mcpserver import MCPServer
 
 
+DEFAULT_SHARED_GID = 1005
+DEFAULT_FILE_UMASK = "0002"
+
+
 class SecurityViolation(Exception):
     """Raised when a security policy violation is detected"""
     pass
@@ -393,6 +397,61 @@ class SecureUbuntuController:
         except KeyError:
             self.current_user = str(os.getuid())
 
+        jobs_dir = Path("/tmp/metis-jobs")
+        try:
+            jobs_dir.mkdir(parents=True, exist_ok=True)
+            self._normalize_shared_path(jobs_dir)
+        except OSError as error:
+            self.logger.warning(f"Could not normalize {jobs_dir}: {error}")
+
+    def _shared_gid(self, path: Optional[Path] = None) -> Optional[int]:
+        """Return the group that should own files created on shared mounts."""
+        configured_gid = os.environ.get("MCP_SHARED_GID", str(DEFAULT_SHARED_GID))
+        if configured_gid:
+            try:
+                return int(configured_gid)
+            except ValueError:
+                self.logger.warning(f"Ignoring invalid MCP_SHARED_GID={configured_gid!r}")
+
+        if path is not None:
+            try:
+                return path.parent.stat().st_gid if not path.is_dir() else path.stat().st_gid
+            except OSError:
+                pass
+
+        groups = os.getgroups()
+        if DEFAULT_SHARED_GID in groups:
+            return DEFAULT_SHARED_GID
+        return groups[-1] if groups else None
+
+    def _normalize_shared_path(self, path: Path, recursive: bool = False) -> None:
+        """Make controller-created paths writable by the shared workspace group."""
+        paths = [path]
+        if recursive and path.is_dir():
+            paths.extend(path.rglob("*"))
+
+        for target in paths:
+            try:
+                gid = self._shared_gid(target)
+                if gid is not None and os.geteuid() == 0:
+                    os.chown(target, -1, gid)
+
+                current_mode = stat.S_IMODE(target.lstat().st_mode)
+                if target.is_dir() and not target.is_symlink():
+                    desired_mode = current_mode | stat.S_IRWXU | stat.S_IRWXG | stat.S_ISGID | stat.S_IROTH | stat.S_IXOTH
+                elif target.is_file():
+                    execute_bits = current_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                    desired_mode = current_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | execute_bits
+                    if execute_bits:
+                        desired_mode |= stat.S_IXUSR | stat.S_IXGRP
+                else:
+                    continue
+
+                if desired_mode != current_mode:
+                    os.chmod(target, desired_mode)
+            except OSError as error:
+                self.logger.warning(f"Could not normalize shared permissions for {target}: {error}")
+
     async def execute_command(self, command: str, working_dir: Optional[str] = None) -> Dict[str, Any]:
         """Execute a shell command with comprehensive security controls"""
         self.audit_logger.log_command(command, self.current_user, working_dir)
@@ -585,12 +644,14 @@ class SecureUbuntuController:
                     # Validate parent directory creation is also allowed
                     self.security_checker.validate_path_access(str(parent_dir), "write")
                     parent_dir.mkdir(parents=True, exist_ok=True)
+                    self._normalize_shared_path(parent_dir, recursive=True)
 
             # Create backup if file exists
             if path_obj.exists() and path_obj.is_file():
                 backup_path = Path(f"{canonical_path}.backup.{int(time.time())}")
                 try:
                     shutil.copy2(canonical_path, backup_path)
+                    self._normalize_shared_path(backup_path)
                     self.logger.info(f"Created backup: {backup_path}")
                 except Exception as e:
                     self.logger.warning(f"Could not create backup for {canonical_path}: {e}")
@@ -614,11 +675,13 @@ class SecureUbuntuController:
                     if path_obj.exists():
                         os.chmod(temp_path_str, stat.S_IMODE(path_obj.stat().st_mode))
                     else:
-                        os.chmod(temp_path_str, 0o664 & ~int(os.environ.get("MCP_FILE_UMASK", "0002"), 8))
+                        os.chmod(temp_path_str, 0o664 & ~int(os.environ.get("MCP_FILE_UMASK", DEFAULT_FILE_UMASK), 8))
+                    self._normalize_shared_path(temp_path)
                 except OSError as chmod_err:
                     self.logger.warning(f"Could not set mode on {temp_path_str}: {chmod_err}")
                 # Atomic move
                 shutil.move(str(temp_path), canonical_path)
+                self._normalize_shared_path(path_obj)
                 self.audit_logger.log_file_access("WRITE", canonical_path, self.current_user, True)
                 return True
             finally:
@@ -659,6 +722,7 @@ class SecureUbuntuController:
         parent = path_obj.parent
         self.security_checker.validate_path_access(str(parent), "write")
         path_obj.mkdir(parents=parents, exist_ok=True)
+        self._normalize_shared_path(path_obj, recursive=True)
         self.audit_logger.log_file_access("CREATE_DIRECTORY", canonical_path, self.current_user, True)
         return {"success": True, "path": canonical_path, "created": True}
 
@@ -680,6 +744,7 @@ class SecureUbuntuController:
             else:
                 destination_path.unlink()
         shutil.move(str(source_path), str(destination_path))
+        self._normalize_shared_path(destination_path, recursive=True)
         self.audit_logger.log_file_access("MOVE", canonical_source, self.current_user, True)
         return {"success": True, "source": canonical_source, "destination": canonical_destination}
 
@@ -717,6 +782,11 @@ class SecureUbuntuController:
             "uid": os.getuid(),
             "gid": os.getgid(),
             "groups": os.getgroups(),
+            "effective_uid": os.geteuid(),
+            "effective_gid": os.getegid(),
+            "mcp_file_umask": os.environ.get("MCP_FILE_UMASK", DEFAULT_FILE_UMASK),
+            "mcp_shared_gid": os.environ.get("MCP_SHARED_GID", str(DEFAULT_SHARED_GID)),
+            "recommended_shared_gid": self._shared_gid(path_obj),
             "readable": os.access(canonical_path, os.R_OK),
             "writable": os.access(canonical_path, os.W_OK),
             "executable": os.access(canonical_path, os.X_OK),
@@ -728,6 +798,15 @@ class SecureUbuntuController:
             },
             "probe": {"requested": probe_write, "success": None},
         }
+        if path_obj.exists():
+            stat_info = path_obj.stat()
+            result["stat"] = {
+                "mode": oct(stat.S_IMODE(stat_info.st_mode)),
+                "permissions": stat.filemode(stat_info.st_mode),
+                "uid": stat_info.st_uid,
+                "gid": stat_info.st_gid,
+                "setgid": bool(stat_info.st_mode & stat.S_ISGID),
+            }
         if probe_write:
             if not path_obj.is_dir():
                 raise ValueError(f"Write probe requires a directory: {canonical_path}")
@@ -738,9 +817,17 @@ class SecureUbuntuController:
                 probe_path = Path(probe_name)
                 with os.fdopen(probe_fd, "w", encoding="utf-8") as probe_file:
                     probe_file.write("create")
+                self._normalize_shared_path(probe_path)
                 probe_path.write_text("update", encoding="utf-8")
                 if probe_path.read_text(encoding="utf-8") != "update":
                     raise OSError("Write probe content verification failed")
+                probe_stat = probe_path.stat()
+                result["probe_stat"] = {
+                    "mode": oct(stat.S_IMODE(probe_stat.st_mode)),
+                    "permissions": stat.filemode(probe_stat.st_mode),
+                    "uid": probe_stat.st_uid,
+                    "gid": probe_stat.st_gid,
+                }
                 probe_path.unlink()
                 result["probe"] = {"requested": True, "success": True}
             except Exception as error:
@@ -824,9 +911,11 @@ class SecureUbuntuController:
         """Start a long running process in the background with tracking."""
         jobs_dir = Path("/tmp/metis-jobs")
         jobs_dir.mkdir(parents=True, exist_ok=True)
+        self._normalize_shared_path(jobs_dir)
         job_id = str(uuid.uuid4())[:8]
         job_path = jobs_dir / job_id
         job_path.mkdir(parents=True, exist_ok=True)
+        self._normalize_shared_path(job_path)
 
         log_file = job_path / "output.log"
         status_file = job_path / "status.json"
@@ -842,6 +931,7 @@ class SecureUbuntuController:
             "start_time": time.time()
         }
         status_file.write_text(json.dumps(status_info, indent=2))
+        self._normalize_shared_path(status_file)
 
         # Launch background process detached
         wrapped_cmd = f"cd {shlex.quote(resolved_working_dir)} && ({command}) > {shlex.quote(str(log_file))} 2>&1; echo $? > {shlex.quote(str(job_path / 'exit_code'))}"
@@ -1361,7 +1451,7 @@ async def main():
     # root-only. The controller writes via tempfile + atomic move; tempfile
     # uses mode 0600 by default, so apply an explicit permissive umask early
     # and chmod the temp file before the move in write_file().
-    file_umask = os.environ.get("MCP_FILE_UMASK", "0002").strip()
+    file_umask = os.environ.get("MCP_FILE_UMASK", DEFAULT_FILE_UMASK).strip()
     try:
         os.umask(int(file_umask, 8))
     except (ValueError, OSError) as e:
