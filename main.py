@@ -38,6 +38,22 @@ DEFAULT_SHARED_GID = 1005
 DEFAULT_FILE_UMASK = "0002"
 
 
+# Host uids/gids (e.g. 1001/1005) usually have no passwd/group entry inside the
+# container, so name lookups must degrade to the numeric id instead of failing.
+def _uid_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def _gid_name(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
 class SecurityViolation(Exception):
     """Raised when a security policy violation is detected"""
     pass
@@ -568,20 +584,18 @@ class SecureUbuntuController:
 
                 try:
                     stat_info = item.stat()
-                    owner_name = pwd.getpwuid(stat_info.st_uid).pw_name
-                    group_name = grp.getgrgid(stat_info.st_gid).gr_name
                     items.append({
                         "name": item.name,
                         "path": str(item),
                         "type": "directory" if item.is_dir() else "file",
                         "size": stat_info.st_size,
                         "permissions": stat.filemode(stat_info.st_mode),
-                        "owner": owner_name,
-                        "group": group_name,
+                        "owner": _uid_name(stat_info.st_uid),
+                        "group": _gid_name(stat_info.st_gid),
                         "modified": stat_info.st_mtime,
                         "is_symlink": item.is_symlink()
                     })
-                except (OSError, KeyError) as e:
+                except OSError as e:
                     items.append({
                         "name": item.name,
                         "type": "unreadable",
@@ -805,6 +819,8 @@ class SecureUbuntuController:
                 "permissions": stat.filemode(stat_info.st_mode),
                 "uid": stat_info.st_uid,
                 "gid": stat_info.st_gid,
+                "owner": _uid_name(stat_info.st_uid),
+                "group": _gid_name(stat_info.st_gid),
                 "setgid": bool(stat_info.st_mode & stat.S_ISGID),
             }
         if probe_write:
