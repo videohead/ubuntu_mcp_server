@@ -1,8 +1,12 @@
 FROM python:3.12-slim
 
-# Tools the server shells out to (apt/dpkg inspection, general utilities)
+# Tools the server shells out to (apt/dpkg inspection, general utilities).
+# docker-cli provides the `docker` CLI so execute_command can run docker
+# commands against the host daemon via the bind-mounted docker.sock (Debian
+# splits docker.io into a daemon-only package + this CLI-only package).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
+    docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --shell /usr/sbin/nologin mcp
