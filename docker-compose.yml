@@ -1,0 +1,48 @@
+name: ubuntu-mcp-server
+
+services:
+  ubuntu-mcp:
+    build: .
+    image: ubuntu-mcp-server:latest
+    container_name: ubuntu-mcp-server
+    # Host user videohead (1001) : optusers (1005) so ./data is writable.
+    user: "1001:1005"
+    ports:
+      # Bind to host loopback only; Traefik (host network) fronts it.
+      - "127.0.0.1:8000:8000"
+    environment:
+      # Security: API key for MCP bridge authentication
+      MCP_BRIDGE_API_KEY_FILE: /run/mcp-bridge/.env
+      PYTHONDONTWRITEBYTECODE: "1"
+      LOG_LEVEL: "INFO"
+    volumes:
+      # Persistent data directory for MCP sessions and state
+      - ubuntu-mcp-data:/data
+      # Copy main.py to server/ directory as expected by ENTRYPOINT
+      - ./server:/app/server:ro
+      # Full repo checkout so main.py sees live source (but .venv stays in image)
+      - ./.venv:/app/.venv:ro
+    working_dir: /app
+    # Durable across restarts; do not auto-restart on container-level errors
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://127.0.0.1:8000/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  metis-network:
+    external: true
+
+volumes:
+  ubuntu-mcp-data:
