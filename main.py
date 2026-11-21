@@ -101,14 +101,87 @@ class SecurityPolicy:
 class SecurityChecker:
     """Centralized security validation and enforcement"""
 
+    # Container-internal paths that should NOT be mapped through HOST_ROOT.
+    # These are paths the server itself uses (its own files, temp dirs, etc.)
+    _CONTAINER_INTERNAL_PREFIXES = (
+        "/app",       # server code
+        "/data",      # persistent data volume
+        "/tmp",       # container temp
+        "/var/tmp",   # container temp
+        "/etc",       # container config
+        "/usr",       # container system
+        "/bin",       # container system
+        "/sbin",      # container system
+        "/lib",       # container system
+        "/lib64",     # container system
+        "/root",      # container root
+        "/home",      # container home
+        "/run",       # container runtime
+        "/dev",       # container devices
+        "/proc",      # container proc
+        "/sys",       # container sys
+        "/boot",      # container boot
+        "/var",       # container var
+    )
+
     def __init__(self, policy: SecurityPolicy):
         self.policy = policy
         self.logger = logging.getLogger(f"{__name__}.security")
+
+        # Host filesystem root (bind mount). When set, user paths are
+        # transparently mapped through this prefix so the server can
+        # read/write host files while running in a container.
+        self.host_root: Optional[str] = os.environ.get("HOST_ROOT") or None
+        if self.host_root:
+            self.host_root = self.host_root.rstrip("/")
+            self.logger.info(f"Host root mapping enabled: {self.host_root}")
 
         # Cache for resolved paths to avoid repeated filesystem calls
         self._path_resolution_cache = {}
         self._cache_max_age = 300  # 5 minutes
         self._cache_timestamps = {}
+
+    def _is_container_internal(self, path: str) -> bool:
+        """Check if a path is container-internal (should not be host-mapped)."""
+        if not self.host_root:
+            return False
+        # Normalize: ensure leading slash
+        normalized = path if path.startswith("/") else "/" + path
+        for prefix in self._CONTAINER_INTERNAL_PREFIXES:
+            if normalized == prefix or normalized.startswith(prefix + "/"):
+                return True
+        # Also treat the host root itself as container-internal
+        if normalized == self.host_root or normalized.startswith(self.host_root + "/"):
+            return True
+        return False
+
+    def _map_to_host(self, path: str) -> str:
+        """
+        Map a user-supplied path through the host root if applicable.
+        If HOST_ROOT is set and the path is not container-internal,
+        prepend the host root so the path resolves inside the bind mount.
+        """
+        if not self.host_root:
+            return path
+        if self._is_container_internal(path):
+            return path
+        # Ensure the path is absolute
+        if not path.startswith("/"):
+            path = "/" + path
+        return f"{self.host_root}{path}"
+
+    def _path_variants(self, path: str) -> List[str]:
+        """
+        Return the path and its host-mapped variant (if applicable).
+        Used to check allowed/forbidden rules against both the
+        container-internal and host-mapped forms of a path.
+        """
+        variants = [path]
+        if self.host_root:
+            mapped = self._map_to_host(path)
+            if mapped != path:
+                variants.append(mapped)
+        return variants
 
     def _get_cache_key(self, path: str) -> str:
         """Generate cache key for path resolution"""
@@ -127,6 +200,9 @@ class SecurityChecker:
 
         Note: Caching disabled by default to prevent TOCTOU vulnerabilities
         """
+        # Map user paths through the host root if applicable
+        path = self._map_to_host(path)
+
         # Only use cache if explicitly enabled in policy
         if self.policy.use_path_cache:
             cache_key = self._get_cache_key(path)
@@ -185,27 +261,34 @@ class SecurityChecker:
                     f"Access denied to critical system path: {canonical_path}"
                 )
 
-        # Check forbidden paths first (higher priority)
+        # Check forbidden paths first (higher priority).
+        # Check both the original path and its host-mapped version so that
+        # forbidden rules apply whether the path is container-internal or
+        # mapped through the host root.
         for forbidden in self.policy.forbidden_paths:
-            # Resolve forbidden paths too for a correct comparison
-            forbidden_canonical = self.resolve_path_safely(forbidden)
-            forbidden_root = Path(forbidden_canonical)
-            if Path(canonical_path) == forbidden_root or forbidden_root in Path(canonical_path).parents:
-                raise SecurityViolation(
-                    f"Path explicitly forbidden: {canonical_path}"
-                )
+            for variant in self._path_variants(forbidden):
+                forbidden_canonical = self.resolve_path_safely(variant)
+                forbidden_root = Path(forbidden_canonical)
+                if Path(canonical_path) == forbidden_root or forbidden_root in Path(canonical_path).parents:
+                    raise SecurityViolation(
+                        f"Path explicitly forbidden: {canonical_path}"
+                    )
 
-        # Check allowed paths
+        # Check allowed paths. A path is allowed if it matches either the
+        # original allowed path or its host-mapped version.
         path_allowed = False
         if not self.policy.allowed_paths:
             # No restrictions if allowed_paths is empty
             path_allowed = True
         else:
             for allowed in self.policy.allowed_paths:
-                allowed_canonical = self.resolve_path_safely(allowed)
-                allowed_root = Path(allowed_canonical)
-                if Path(canonical_path) == allowed_root or allowed_root in Path(canonical_path).parents:
-                    path_allowed = True
+                for variant in self._path_variants(allowed):
+                    allowed_canonical = self.resolve_path_safely(variant)
+                    allowed_root = Path(allowed_canonical)
+                    if Path(canonical_path) == allowed_root or allowed_root in Path(canonical_path).parents:
+                        path_allowed = True
+                        break
+                if path_allowed:
                     break
 
         if not path_allowed:
@@ -413,7 +496,7 @@ class SecureUbuntuController:
         except KeyError:
             self.current_user = str(os.getuid())
 
-        jobs_dir = Path("/tmp/metis-jobs")
+        jobs_dir = Path("/tmp/jobs")
         try:
             jobs_dir.mkdir(parents=True, exist_ok=True)
             self._normalize_shared_path(jobs_dir)
@@ -925,7 +1008,7 @@ class SecureUbuntuController:
 
     def start_background_job(self, command: str, description: str = "", working_dir: str = "/opt") -> Dict[str, Any]:
         """Start a long running process in the background with tracking."""
-        jobs_dir = Path("/tmp/metis-jobs")
+        jobs_dir = Path("/tmp/-jobs")
         jobs_dir.mkdir(parents=True, exist_ok=True)
         self._normalize_shared_path(jobs_dir)
         job_id = str(uuid.uuid4())[:8]
@@ -963,7 +1046,7 @@ class SecureUbuntuController:
 
     def get_job_status(self, job_id: str, tail_lines: int = 50) -> Dict[str, Any]:
         """Get the status and output of a background job."""
-        jobs_dir = Path("/tmp/metis-jobs")
+        jobs_dir = Path("/tmp/-jobs")
         job_path = jobs_dir / job_id
         if not job_path.exists():
             raise ValueError(f"Job '{job_id}' not found")
@@ -996,7 +1079,7 @@ class SecureUbuntuController:
 
     def list_background_jobs(self) -> List[Dict[str, Any]]:
         """List all background jobs and their statuses."""
-        jobs_dir = Path("/tmp/metis-jobs")
+        jobs_dir = Path("/tmp/-jobs")
         if not jobs_dir.exists():
             return []
 
@@ -1084,9 +1167,6 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
     controller = SecureUbuntuController(security_policy)
     mcp = MCPServer("Secure Ubuntu Controller")
 
-    def format_error(e: Exception) -> str:
-        return json.dumps({"error": str(e), "type": type(e).__name__}, indent=2)
-
     @mcp.tool("execute_command")
     async def execute_command(command: str, working_dir: str = None) -> str:
         """Executes a shell command on the Ubuntu system.
@@ -1096,11 +1176,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             A JSON string with the command results, including stdout, stderr, and return code.
         """
-        try:
-            result = await controller.execute_command(command, working_dir)
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return format_error(e)
+        result = await controller.execute_command(command, working_dir)
+        return json.dumps(result, indent=2)
 
     @mcp.tool("list_directory")
     async def list_directory(path: str) -> str:
@@ -1110,11 +1187,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             A JSON string with the directory contents.
         """
-        try:
-            items = controller.list_directory(path)
-            return json.dumps(items, indent=2)
-        except Exception as e:
-            return format_error(e)
+        items = controller.list_directory(path)
+        return json.dumps(items, indent=2)
 
     @mcp.tool("read_file")
     async def read_file(file_path: str) -> str:
@@ -1124,11 +1198,7 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             The raw file contents as a string, or a JSON error object on failure.
         """
-        try:
-            return controller.read_file(file_path)
-        except Exception as e:
-            # Distinguish content from error by returning JSON for errors
-            return format_error(e)
+        return controller.read_file(file_path)
 
     @mcp.tool("write_file")
     async def write_file(file_path: str, content: str, create_dirs: bool = False) -> str:
@@ -1140,11 +1210,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             A success message or a JSON error object on failure.
         """
-        try:
-            success = controller.write_file(file_path, content, create_dirs)
-            return json.dumps({"success": success, "path": file_path})
-        except Exception as e:
-            return format_error(e)
+        success = controller.write_file(file_path, content, create_dirs)
+        return json.dumps({"success": success, "path": file_path})
 
     @mcp.tool("update_file")
     async def update_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
@@ -1156,42 +1223,27 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
             new_string: Replacement text.
             replace_all: Replace every occurrence; otherwise exactly one match is required.
         """
-        try:
-            return json.dumps(controller.update_file(file_path, old_string, new_string, replace_all), indent=2)
-        except Exception as e:
-            return format_error(e)
+        return json.dumps(controller.update_file(file_path, old_string, new_string, replace_all), indent=2)
 
     @mcp.tool("create_directory")
     async def create_directory(path: str, parents: bool = True) -> str:
         """Creates an allowed directory, optionally including missing parents."""
-        try:
-            return json.dumps(controller.create_directory(path, parents), indent=2)
-        except Exception as e:
-            return format_error(e)
+        return json.dumps(controller.create_directory(path, parents), indent=2)
 
     @mcp.tool("move_path")
     async def move_path(source: str, destination: str, overwrite: bool = False) -> str:
         """Moves or renames a file or directory within allowed paths."""
-        try:
-            return json.dumps(controller.move_path(source, destination, overwrite), indent=2)
-        except Exception as e:
-            return format_error(e)
+        return json.dumps(controller.move_path(source, destination, overwrite), indent=2)
 
     @mcp.tool("delete_path")
     async def delete_path(path: str, recursive: bool = False) -> str:
         """Deletes a file or directory after policy and permission validation."""
-        try:
-            return json.dumps(controller.delete_path(path, recursive), indent=2)
-        except Exception as e:
-            return format_error(e)
+        return json.dumps(controller.delete_path(path, recursive), indent=2)
 
     @mcp.tool("filesystem_diagnostics")
     async def filesystem_diagnostics(path: str = "/opt", probe_write: bool = False) -> str:
         """Reports effective access for a path and optionally runs a temporary CRUD probe."""
-        try:
-            return json.dumps(controller.filesystem_diagnostics(path, probe_write), indent=2)
-        except Exception as e:
-            return format_error(e)
+        return json.dumps(controller.filesystem_diagnostics(path, probe_write), indent=2)
 
     @mcp.tool("get_system_info")
     async def get_system_info() -> str:
@@ -1199,11 +1251,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             A JSON string with system information.
         """
-        try:
-            info = controller.get_system_info()
-            return json.dumps(info, indent=2)
-        except Exception as e:
-            return format_error(e)
+        info = controller.get_system_info()
+        return json.dumps(info, indent=2)
 
     @mcp.tool("install_package")
     async def install_package(package_name: str) -> str:
@@ -1218,16 +1267,13 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             JSON string with the results from 'apt list'.
         """
-        try:
-            if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.+-]+$', package_name):
-                raise SecurityViolation(f"Invalid package name format: {package_name}")
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.+-]+$', package_name):
+            raise SecurityViolation(f"Invalid package name format: {package_name}")
 
-            # Using 'apt list' is safer than 'apt install'
-            command = f"apt list --installed {shlex.quote(package_name)}"
-            result = await controller.execute_command(command)
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return format_error(e)
+        # Using 'apt list' is safer than 'apt install'
+        command = f"apt list --installed {shlex.quote(package_name)}"
+        result = await controller.execute_command(command)
+        return json.dumps(result, indent=2)
 
     @mcp.tool("search_packages")
     async def search_packages(query: str) -> str:
@@ -1240,15 +1286,12 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             JSON string with the search results.
         """
-        try:
-            if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.+-]+$', query):
-                raise SecurityViolation(f"Invalid search query format: {query}")
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.+-]+$', query):
+            raise SecurityViolation(f"Invalid search query format: {query}")
 
-            command = f"apt search {shlex.quote(query)}"
-            result = await controller.execute_command(command)
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return format_error(e)
+        command = f"apt search {shlex.quote(query)}"
+        result = await controller.execute_command(command)
+        return json.dumps(result, indent=2)
 
     @mcp.tool("list_agent_skills")
     async def list_agent_skills() -> str:
@@ -1258,11 +1301,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             JSON string containing lists of available skills and specialized agents.
         """
-        try:
-            skills = controller.list_agent_skills()
-            return json.dumps(skills, indent=2)
-        except Exception as e:
-            return format_error(e)
+        skills = controller.list_agent_skills()
+        return json.dumps(skills, indent=2)
 
     @mcp.tool("load_agent_skill")
     async def load_agent_skill(skill_name: str) -> str:
@@ -1275,10 +1315,7 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             The raw Markdown text containing the skill/agent guidelines.
         """
-        try:
-            return controller.load_agent_skill(skill_name)
-        except Exception as e:
-            return format_error(e)
+        return controller.load_agent_skill(skill_name)
 
     @mcp.tool("start_background_job")
     async def start_background_job(command: str, description: str = "", working_dir: str = "/opt") -> str:
@@ -1293,11 +1330,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             JSON string with job_id, status, and log_file path.
         """
-        try:
-            res = controller.start_background_job(command, description, working_dir)
-            return json.dumps(res, indent=2)
-        except Exception as e:
-            return format_error(e)
+        res = controller.start_background_job(command, description, working_dir)
+        return json.dumps(res, indent=2)
 
     @mcp.tool("get_job_status")
     async def get_job_status(job_id: str, tail_lines: int = 50) -> str:
@@ -1311,11 +1345,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             JSON string with job status, return code, and recent output logs.
         """
-        try:
-            res = controller.get_job_status(job_id, tail_lines)
-            return json.dumps(res, indent=2)
-        except Exception as e:
-            return format_error(e)
+        res = controller.get_job_status(job_id, tail_lines)
+        return json.dumps(res, indent=2)
 
     @mcp.tool("list_background_jobs")
     async def list_background_jobs() -> str:
@@ -1325,11 +1356,8 @@ def create_ubuntu_mcp_server(security_policy: SecurityPolicy) -> MCPServer:
         Returns:
             JSON list of all background jobs and their execution states.
         """
-        try:
-            jobs = controller.list_background_jobs()
-            return json.dumps(jobs, indent=2)
-        except Exception as e:
-            return format_error(e)
+        jobs = controller.list_background_jobs()
+        return json.dumps(jobs, indent=2)
 
     return mcp
 

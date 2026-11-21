@@ -9,12 +9,14 @@ services:
     user: "1001:1005"
     ports:
       # Bind to host loopback only; Traefik (host network) fronts it.
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       # Security: API key for MCP bridge authentication
       MCP_BRIDGE_API_KEY_FILE: /run/mcp-bridge/.env
       PYTHONDONTWRITEBYTECODE: "1"
       LOG_LEVEL: "INFO"
+      # Root of the host filesystem bind mount; user paths are mapped through it
+      HOST_ROOT: /host
     volumes:
       # Persistent data directory for MCP sessions and state
       - ubuntu-mcp-data:/data
@@ -22,6 +24,9 @@ services:
       - ./server:/app/server:ro
       # Full repo checkout so main.py sees live source (but .venv stays in image)
       - ./.venv:/app/.venv:ro
+      # Host filesystem so the MCP server can read/write host files.
+      # Mounted at /host; the server maps user paths through this prefix.
+      - /:/host:rw
     working_dir: /app
     # Durable across restarts; do not auto-restart on container-level errors
     restart: unless-stopped
@@ -29,7 +34,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://127.0.0.1:8000/ready"]
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8000),timeout=5); s.close()"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -39,10 +44,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-networks:
-  metis-network:
-    external: true
 
 volumes:
   ubuntu-mcp-data:

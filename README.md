@@ -1,3 +1,50 @@
+# ⚠️ Docker-Only Deployment
+
+**This service MUST run exclusively in Docker.** Do not attempt to run it on the host machine.
+
+## Why Docker-Only?
+
+- **Isolation**: Dependencies and configuration are contained and won't conflict with the host
+- **Resource Management**: CPU, memory, and GPU resources are properly allocated and limited
+- **Port Management**: All ports are mapped consistently through Docker networking
+- **Easy Restart**: Clean stop/start cycles through Docker Compose
+- **Consistency**: Ensures the entire stack behaves identically across environments
+
+## Startup
+
+**Use the main stack script (recommended):**
+```bash
+bash /opt/chatbot/scripts/stack start
+```
+
+**Or start this service's Docker Compose directly:**
+```bash
+cd /opt/PROJECT_NAME
+docker-compose up -d
+docker-compose logs -f
+```
+
+## Shutdown
+
+**Via main stack script:**
+```bash
+bash /opt/chatbot/scripts/stack stop
+```
+
+**Or stop this service's Docker Compose:**
+```bash
+cd /opt/PROJECT_NAME
+docker-compose down
+```
+
+## Documentation
+
+For comprehensive deployment and configuration details, see:
+- [`/opt/litellm/AGENTS.md`](../litellm/AGENTS.md) - Quick reference for Docker-only requirement
+- [`/opt/litellm/.github/instructions/instructions.md`](../litellm/.github/instructions/instructions.md) - Full deployment guide
+
+---
+
 # Secure Ubuntu MCP Server
 
 > 🔒 **Security-First** Model Context Protocol server for safe Ubuntu system operations
